@@ -428,6 +428,87 @@ func agentRequestTimeout() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+// SendPostRequestToAgent POSTs body to the agent and returns the HTTP status
+// code with the response body. The body travels on the SSH session's stdin and
+// never on the command line, so credentials inside it do not show up in the
+// remote host's process list, the agent's access log or this server's DEBUG
+// log. The status code is returned as is: deciding what counts as a failure,
+// and how to read an error body, is up to the caller.
+func (o *SSH) SendPostRequestToAgent(connectionInfo model.ConnectionInfo, requestPath string, body []byte) (int, string, error) {
+	if err := o.NewClientConn(connectionInfo); err != nil {
+		return 0, "", err
+	}
+	defer o.Close()
+
+	timeout := agentRequestTimeout()
+	cmd := agentPostCmd(o.agentPort(), requestPath, timeout)
+
+	// RunCmd cannot feed stdin, so the session is opened here and bounded the
+	// same way runCmd bounds one: closing it unblocks session.Run.
+	session, err := o.Options.client.NewSession()
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to create session: %s", err)
+	}
+	defer func() {
+		_ = session.Close()
+	}()
+
+	var output, stderr bytes.Buffer
+	session.Stdin = bytes.NewReader(body)
+	session.Stdout = &output
+	session.Stderr = &stderr
+
+	// Log the command only: the body is where the secrets are.
+	logger.Println(logger.DEBUG, false, "SSH: ("+o.ConnectionInfo.IPAddress+") Running command: "+cmd)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(cmd)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			return 0, "", fmt.Errorf("%s: %s", err, strings.TrimSpace(stderr.String()))
+		}
+	case <-time.After(timeout + 10*time.Second):
+		_ = session.Close()
+
+		return 0, "", fmt.Errorf("command timed out after %s: %s", timeout+10*time.Second, cmd)
+	}
+
+	return splitAgentStatus(output.String())
+}
+
+// agentPostCmd builds the curl command for SendPostRequestToAgent. curl reads
+// the body from stdin (--data-binary @-) and appends the status code on a line
+// of its own, because curl -s exits 0 on HTTP 4xx/5xx and the agent's error
+// body would otherwise pass for a result. The URL is quoted for the same reason
+// as in SendGetRequestToAgent.
+func agentPostCmd(port string, requestPath string, timeout time.Duration) string {
+	return "curl -s --max-time " + strconv.Itoa(int(timeout.Seconds())) +
+		" -X POST 'http://localhost:" + port + "/honeybee-agent" + requestPath + "'" +
+		" -H 'accept: application/json' -H 'Content-Type: application/json'" +
+		" --data-binary @- -w '\\n%{http_code}'"
+}
+
+// splitAgentStatus separates the status code curl appended after the last
+// newline from the response body, leaving the body byte for byte as the agent
+// sent it.
+func splitAgentStatus(output string) (int, string, error) {
+	i := strings.LastIndex(output, "\n")
+	if i < 0 {
+		return 0, "", errors.New("agent response has no status code")
+	}
+
+	code, err := strconv.Atoi(strings.TrimSpace(output[i+1:]))
+	if err != nil {
+		return 0, "", fmt.Errorf("agent response has an invalid status code: %q", output[i+1:])
+	}
+
+	return code, output[:i], nil
+}
+
 func (o *SSH) CheckKubernetes(connectionInfo model.ConnectionInfo) (bool, error) {
 	if err := o.NewClientConn(connectionInfo); err != nil {
 		return false, err
