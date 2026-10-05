@@ -679,60 +679,41 @@ func doGetConnectionInfo(connID string, refresh bool) (*model.ConnectionInfo, er
 				}
 			}
 		case serverCommon.SourceGroupTypeDB:
-			if connectionInfo.DBAccessType == model.AccessTypeSSHTunnel {
-				// db_host is resolved from the SSH host's side, so the SSH host is
-				// what this server can check; the agent there does the collection.
-				c := &ssh.SSH{}
-				if err := c.NewClientConn(*connectionInfo); err != nil {
-					oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
-					oldConnectionInfo.ConnectionFailedMessage = err.Error()
-				} else {
-					c.Close()
-					oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusSuccess
-					oldConnectionInfo.ConnectionFailedMessage = ""
-				}
-
-				if err := c.RunAgent(*connectionInfo); err != nil {
-					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
-					oldConnectionInfo.AgentFailedMessage = err.Error()
-				} else {
-					c.Close()
-					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusSuccess
-					oldConnectionInfo.AgentFailedMessage = ""
-				}
-				break
-			}
-
-			// direct: reachability of the DBMS port from this server. No agent is
-			// involved, marked the way on-prem k8s is.
+			// connection_status is TCP reachability of the DBMS from where it is
+			// inspected: this server for direct, the SSH host for ssh-tunnel, from
+			// whose side db_host is resolved. Whether the credentials work is
+			// decided by an import, not here.
 			timeout := defaultProbeTimeout
 			if connectionInfo.DBConnectTimeout > 0 {
 				timeout = time.Duration(connectionInfo.DBConnectTimeout) * time.Second
 			}
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(connectionInfo.DBHost, connectionInfo.DBPort), timeout)
-			if err != nil {
-				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
-				oldConnectionInfo.ConnectionFailedMessage = err.Error()
+			addr := net.JoinHostPort(connectionInfo.DBHost, connectionInfo.DBPort)
+			var probeErr error
+			if connectionInfo.DBAccessType == model.AccessTypeSSHTunnel {
+				// telnet:// is curl's raw-TCP scheme: no DB protocol is spoken,
+				// which keeps this a reachability check like the dial below.
+				c := &ssh.SSH{}
+				probeErr = c.ProbeFromHost(*connectionInfo, "telnet://"+addr, timeout)
 			} else {
-				_ = conn.Close()
+				conn, dialErr := net.DialTimeout("tcp", addr, timeout)
+				if dialErr == nil {
+					_ = conn.Close()
+				}
+				probeErr = dialErr
+			}
+			if probeErr != nil {
+				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
+				oldConnectionInfo.ConnectionFailedMessage = probeErr.Error()
+			} else {
 				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusSuccess
 				oldConnectionInfo.ConnectionFailedMessage = ""
 			}
-			oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
-			oldConnectionInfo.AgentFailedMessage = "agent-based collection is not applicable to direct db connections"
-		case serverCommon.SourceGroupTypeMinIO:
-			if connectionInfo.OSAccessType == model.AccessTypeSSHTunnel {
-				// The endpoint is resolved from the SSH host's side, as for db.
-				c := &ssh.SSH{}
-				if err := c.NewClientConn(*connectionInfo); err != nil {
-					oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
-					oldConnectionInfo.ConnectionFailedMessage = err.Error()
-				} else {
-					c.Close()
-					oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusSuccess
-					oldConnectionInfo.ConnectionFailedMessage = ""
-				}
 
+			// ssh-tunnel collects through the agent on the SSH host. direct is
+			// inspected by this server and installs no agent, marked the way
+			// on-prem k8s is.
+			if connectionInfo.DBAccessType == model.AccessTypeSSHTunnel {
+				c := &ssh.SSH{}
 				if err := c.RunAgent(*connectionInfo); err != nil {
 					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
 					oldConnectionInfo.AgentFailedMessage = err.Error()
@@ -741,36 +722,70 @@ func doGetConnectionInfo(connID string, refresh bool) (*model.ConnectionInfo, er
 					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusSuccess
 					oldConnectionInfo.AgentFailedMessage = ""
 				}
+			} else {
+				oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
+				oldConnectionInfo.AgentFailedMessage = "agent-based collection is not applicable to direct db connections"
+			}
+		case serverCommon.SourceGroupTypeMinIO:
+			// Both access types need the endpoint, so it is resolved first. A
+			// connection that cannot be resolved can be neither probed nor
+			// collected, and both statuses say why.
+			endpoint, _, useSSL, _, resolveErr := resolveS3Endpoint(sourceGroup, connectionInfo)
+			if resolveErr != nil {
+				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
+				oldConnectionInfo.ConnectionFailedMessage = resolveErr.Error()
+				oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
+				oldConnectionInfo.AgentFailedMessage = resolveErr.Error()
 				break
 			}
-
-			// direct: reachability of the S3 endpoint from this server.
 			// resolveS3Endpoint already returns host[:port]; a missing port is the
 			// scheme's default.
-			endpoint, _, useSSL, _, err := resolveS3Endpoint(sourceGroup, connectionInfo)
-			if err == nil {
-				if _, _, splitErr := net.SplitHostPort(endpoint); splitErr != nil {
-					if useSSL {
-						endpoint = net.JoinHostPort(endpoint, "443")
-					} else {
-						endpoint = net.JoinHostPort(endpoint, "80")
-					}
-				}
-				var conn net.Conn
-				conn, err = net.DialTimeout("tcp", endpoint, defaultProbeTimeout)
-				if err == nil {
-					_ = conn.Close()
+			if _, _, splitErr := net.SplitHostPort(endpoint); splitErr != nil {
+				if useSSL {
+					endpoint = net.JoinHostPort(endpoint, "443")
+				} else {
+					endpoint = net.JoinHostPort(endpoint, "80")
 				}
 			}
-			if err != nil {
+			// A tunnelled endpoint is resolved from the SSH host's side, where the
+			// agent inspects it, so that is where it is probed.
+			var probeErr error
+			if connectionInfo.OSAccessType == model.AccessTypeSSHTunnel {
+				scheme := "http"
+				if useSSL {
+					scheme = "https"
+				}
+				c := &ssh.SSH{}
+				probeErr = c.ProbeFromHost(*connectionInfo, scheme+"://"+endpoint+"/", defaultProbeTimeout)
+			} else {
+				conn, dialErr := net.DialTimeout("tcp", endpoint, defaultProbeTimeout)
+				if dialErr == nil {
+					_ = conn.Close()
+				}
+				probeErr = dialErr
+			}
+			if probeErr != nil {
 				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusFailed
-				oldConnectionInfo.ConnectionFailedMessage = err.Error()
+				oldConnectionInfo.ConnectionFailedMessage = probeErr.Error()
 			} else {
 				oldConnectionInfo.ConnectionStatus = model.ConnectionInfoStatusSuccess
 				oldConnectionInfo.ConnectionFailedMessage = ""
 			}
-			oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
-			oldConnectionInfo.AgentFailedMessage = "agent-based collection is not applicable to direct object storage connections"
+
+			if connectionInfo.OSAccessType == model.AccessTypeSSHTunnel {
+				c := &ssh.SSH{}
+				if err := c.RunAgent(*connectionInfo); err != nil {
+					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
+					oldConnectionInfo.AgentFailedMessage = err.Error()
+				} else {
+					c.Close()
+					oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusSuccess
+					oldConnectionInfo.AgentFailedMessage = ""
+				}
+			} else {
+				oldConnectionInfo.AgentStatus = model.ConnectionInfoStatusFailed
+				oldConnectionInfo.AgentFailedMessage = "agent-based collection is not applicable to direct object storage connections"
+			}
 		default:
 			if connectionInfo.ResourceType == serverCommon.ResourceTypeK8s {
 				// on-prem k8s has no SSH host. The kubeconfig (validated at

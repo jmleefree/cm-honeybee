@@ -393,6 +393,73 @@ func (o *SSH) checkAgentStatus() error {
 	return errors.New("agent health check failed")
 }
 
+// ProbeFromHost reports whether the source host can open a TCP connection to
+// the host:port in rawURL. It runs curl on the source host, so it sees what the
+// agent sees when it inspects a tunnelled database or bucket.
+//
+// Success is "the TCP handshake completed" (%{time_connect} > 0), the same bar
+// the direct path's net.DialTimeout sets. curl's exit code is not the verdict:
+// a telnet:// probe of a DBMS ends on --max-time (28) even after a successful
+// connect, and an https:// probe can fail TLS verification (60) against a
+// server that is plainly reachable. The code only explains a failure.
+func (o *SSH) ProbeFromHost(connectionInfo model.ConnectionInfo, rawURL string, timeout time.Duration) error {
+	if err := o.NewClientConn(connectionInfo); err != nil {
+		return err
+	}
+	defer o.Close()
+
+	secs := int(timeout.Seconds())
+	if secs < 1 {
+		secs = 1
+	}
+	// rawURL carries a user-supplied host, and the command runs in the source
+	// host's shell (sh, bash, zsh). Single quotes leave it literal; a quote
+	// inside it is closed, escaped and reopened.
+	quotedURL := "'" + strings.ReplaceAll(rawURL, "'", `'\''`) + "'"
+	// "; echo" keeps the session's exit status 0: runCmd drops stdout on a
+	// non-zero exit, so curl's own code is read from the output instead.
+	// stdin is /dev/null so a telnet:// probe has nothing to send.
+	cmd := "curl -s -o /dev/null" +
+		" --connect-timeout " + strconv.Itoa(secs) +
+		" --max-time " + strconv.Itoa(secs+1) +
+		" -w '%{time_connect}' " + quotedURL +
+		" </dev/null; echo \" $?\""
+
+	out, err := o.RunCmdWithTimeout(cmd, timeout+5*time.Second)
+	if err != nil {
+		return err
+	}
+
+	// "<time_connect> <exit>" normally; just "<exit>" when curl never ran.
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return errors.New("empty probe output from the source host")
+	}
+	if len(fields) == 2 {
+		if t, perr := strconv.ParseFloat(fields[0], 64); perr == nil && t > 0 {
+			return nil
+		}
+	}
+
+	var reason string
+	switch code := fields[len(fields)-1]; code {
+	case "1":
+		reason = "unsupported protocol (curl on the source host lacks it)"
+	case "6":
+		reason = "could not resolve host"
+	case "7":
+		reason = "connection refused"
+	case "28":
+		reason = "timed out"
+	case "127":
+		reason = "curl is not installed on the source host"
+	default:
+		reason = "curl exit code " + code
+	}
+
+	return fmt.Errorf("not reachable from the source host (%s): %s", rawURL, reason)
+}
+
 func (o *SSH) SendGetRequestToAgent(connectionInfo model.ConnectionInfo, requestPath string) (string, error) {
 	if err := o.NewClientConn(connectionInfo); err != nil {
 		return "", err
