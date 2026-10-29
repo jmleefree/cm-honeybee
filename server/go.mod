@@ -6,10 +6,10 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.2
 	github.com/cloud-barista/cb-spider v0.13.14
 	github.com/cloud-barista/cm-beetle/imdl v0.1.16
-	github.com/cloud-barista/cm-centipede/dmdl v0.1.0
-	github.com/cloud-barista/cm-centipede/transx-ex v0.1.1
+	github.com/cloud-barista/cm-centipede/dmdl v0.1.1
+	github.com/cloud-barista/cm-centipede/transx-ex v0.1.2
 	github.com/cloud-barista/cm-grasshopper/smdl v0.1.4
-	github.com/cloud-barista/cm-honeybee/agent v0.0.0-20261002101832-9fb748931e6b
+	github.com/cloud-barista/cm-honeybee/agent v0.0.0-20261019111008-e7cd081474a0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/jollaman999/utils v1.0.10 // Original codes from https://github.com/hcloud-classic/hcc-harp
